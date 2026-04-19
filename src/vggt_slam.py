@@ -139,32 +139,3 @@ class VGGTSlamPipeline:
         else:
             warn("without VGGT pipline would work only in viewer mode")
             
-            
-            
-        
-
-    
-        
-        
-    
-
-    
-    
-            
-            
-            
-            
-            
-
-
-
-
-
-        
-
-         
-        
-
-        
-
-    
