@@ -139,13 +139,6 @@ class VGGTSlamPipeline:
         else:
             warn("without VGGT pipline would work only in viewer mode")
             
-
-
-# if __name__ == "__main__":
-
-#     config = VGGTSLAMConfig()
-#     vggt_slam = VGGTSlamPipeline(config)
-    
             
             
         
