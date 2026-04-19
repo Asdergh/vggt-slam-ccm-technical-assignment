@@ -13,7 +13,7 @@
 
 ### VGGT 
 В основе всего пайплайна лежит темпоральный трансформер VGGT (Visual Geometry Grounded Transformer). Модель обладает уникальным механизмом обработки визуальных токенов последовательностей изображений, а так же ветвлением из 4 голов имеющих отдельную параметризацию и работающих с разными типами токенов.
-![VGGT Model](<assets/Untitled Diagram-Page-2.drawio.svg>)
+![VGGT Model](assets/VGGT_base.svg)
 
 #### Alternating-Attention
 Пусть $\mathcal{I} = \cup^{B}_{i = 1}\big[\mathcal{I}_{1}\big] \in \mathbb{R}^{B \times N \times 3 \times W \times H}$ входной батч последовательсностей изображений где  $\mathcal{I}_{i} = \cup^{N}_{i = 1}\big[I^{i}_1\big] \in \mathbb{R}^{N \times 3 \times W \times H}$.  В качестве backbone энкодера VGGT использует DINO v3 который в свою очередь является трансформерной надстройкой над ViT Patch энкодером. Мы же опустим различия между различными вариациями и модификациями ViT модели и будет обозначать энкодер как $\mathcal{A}_{\theta}\big[\mathcal{I}\big]: \mathcal{I} \rightarrow \cup^{B}_{i = 1}\big[\mathcal{T}_{I_1}\big] \in \mathbb{R}^{B \times N \times N_{p} \times d}$, где  $N_{p} = (\frac{W}{P} \times \frac{H}{P})$.
