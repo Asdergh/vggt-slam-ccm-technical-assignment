@@ -94,6 +94,9 @@ def main():
     total_time_start = time.time()
     keyframe_time = utils.Accumulator()
     backend_time = utils.Accumulator()
+    
+    update_loop_vis = 0
+    update_all_vis = 0
     for image_name in tqdm(image_names):
         if use_optical_flow_downsample:
             with keyframe_time:
@@ -123,8 +126,12 @@ def main():
             if args.vis_map:
                 if loop_closure_detected:
                     solver.update_all_submap_vis()
+                    print(f"Updating loop vis: {update_loop_vis}")
+                    update_loop_vis += 1
                 else:
                     solver.update_latest_submap_vis()
+                    print(f"Update al vis: {update_all_vis}")
+                    update_all_vis += 1
             
             # Reset for next submap.
             image_names_subset = image_names_subset[-args.overlapping_window_size:]
