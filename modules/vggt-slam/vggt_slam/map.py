@@ -173,7 +173,8 @@ class GraphMap:
                 # save pcd as numpy array
                 np.savez(f"{file_name}/{frame_id}.npz", pointcloud=pointcloud, mask=conf_masks)
         assert count == len(self.rectifying_H_mats), "Number of rectifying mats and number of point maps do not match"
-            
+                
+
     def write_points_to_file(self, graph, file_name):
         pcd_all = []
         colors_all = []

@@ -25,7 +25,9 @@ class TestLoadVideoFramesRouting(unittest.TestCase):
         self.assertEqual(result, ("frames", 480, 640))
 
     @patch("sam3.model.io_utils.load_video_frames_from_video_file")
-    def test_mov_extension_routes_to_video_loader(self, mock_load_video):
+    def test_mov_extension_routes_to_video_loader(
+        self, mock_load_video: MagicMock
+    ) -> None:
         """Paths with .mov extension should route to load_video_frames_from_video_file."""
         mock_load_video.return_value = ("frames", 480, 640)
         load_video_frames(
@@ -48,7 +50,9 @@ class TestLoadVideoFramesRouting(unittest.TestCase):
         self.assertEqual(result, ("frames", 480, 640))
 
     @patch("sam3.model.io_utils.load_video_frames_from_video_file")
-    def test_extensionless_bare_hash_routes_to_video_loader(self, mock_load_video):
+    def test_extensionless_bare_hash_routes_to_video_loader(
+        self, mock_load_video: MagicMock
+    ) -> None:
         """Bare hash paths without extension should attempt video loading."""
         mock_load_video.return_value = ("frames", 480, 640)
         result = load_video_frames(
@@ -73,7 +77,9 @@ class TestLoadVideoFramesRouting(unittest.TestCase):
         self.assertIn("oil://fb_permanent/corrupted_file", str(ctx.exception))
 
     @patch("sam3.model.io_utils.load_video_frames_from_image_folder")
-    def test_directory_routes_to_image_folder_loader(self, mock_load_folder):
+    def test_directory_routes_to_image_folder_loader(
+        self, mock_load_folder: MagicMock
+    ) -> None:
         """Directory paths should route to load_video_frames_from_image_folder."""
         mock_load_folder.return_value = ("frames", 480, 640)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -96,7 +102,9 @@ class TestLoadVideoFramesRouting(unittest.TestCase):
         self.assertEqual(w, 640)
 
     @patch("sam3.model.io_utils.load_video_frames_from_video_file")
-    def test_unknown_extension_routes_to_video_loader(self, mock_load_video):
+    def test_unknown_extension_routes_to_video_loader(
+        self, mock_load_video: MagicMock
+    ) -> None:
         """Paths with unrecognized extensions should attempt video loading."""
         mock_load_video.return_value = ("frames", 480, 640)
         result = load_video_frames(

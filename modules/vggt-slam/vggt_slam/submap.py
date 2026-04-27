@@ -5,17 +5,8 @@ import torch
 import numpy as np
 import scipy
 import open3d as o3d
-from dataclasses import (dataclass, fields)
-from typing import (Any, )
 from vggt_slam.slam_utils import decompose_camera
 
-
-
-# @dataclass 
-# class Viewpoint:
-#     uid: Any
-#     intrinsics: 
-    
 class Submap:
     def __init__(self, submap_id):
         self.submap_id = submap_id

@@ -56,7 +56,6 @@ class Sam3Processor:
 
         state["original_height"] = height
         state["original_width"] = width
-        print(image.size(), image.dtype)
         state["backbone_out"] = self.model.backbone.forward_image(image)
         inst_interactivity_en = self.model.inst_interactive_predictor is not None
         if inst_interactivity_en and "sam2_backbone_out" in state["backbone_out"]:

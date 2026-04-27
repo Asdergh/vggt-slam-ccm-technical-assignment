@@ -12,9 +12,9 @@ def addmm_act(activation, linear, mat1):
         raise ValueError("Expected grad to be disabled.")
     self = linear.bias.detach()
     mat2 = linear.weight.detach()
-    self = self.to(torch.float32)
-    mat1 = mat1.to(torch.float32)
-    mat2 = mat2.to(torch.float32)
+    self = self.to(torch.bfloat16)
+    mat1 = mat1.to(torch.bfloat16)
+    mat2 = mat2.to(torch.bfloat16)
     mat1_flat = mat1.view(-1, mat1.shape[-1])
     if activation in [torch.nn.functional.relu, torch.nn.ReLU]:
         y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=False)

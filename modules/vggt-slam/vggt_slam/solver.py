@@ -220,6 +220,7 @@ class Solver:
         conf = pred_dict["depth_conf"]  # (S, H, W)
 
         world_points = unproject_depth_map_to_point_map(depth_map, extrinsics_cam, intrinsics_cam)
+
         colors = (images.transpose(0, 2, 3, 1) * 255).astype(np.uint8)  # now (S, H, W, 3)
         cam_to_world = closed_form_inverse_se3(extrinsics_cam)  # shape (S, 4, 4)
         h, w = world_points.shape[1:3]
@@ -309,9 +310,7 @@ class Solver:
         if self.map.get_largest_key() is None:
             new_pcd_num = 0
         else:
-            new_pcd_num = self.map.get_largest_key() \
-                + self.map.get_latest_submap()\
-                .get_last_non_loop_frame_index() + 1
+            new_pcd_num = self.map.get_largest_key() + self.map.get_latest_submap().get_last_non_loop_frame_index() + 1
 
         print(f"Creating new submap with id {new_pcd_num}")
         t1 = time.time()
@@ -334,7 +333,6 @@ class Solver:
             t1 = time.time()
             with self.vggt_timer:
                 predictions = model(images)
-                predictions["images"] = images
             print(f"VGGT model inference took {time.time() - t1:.2f} seconds")
 
         # Check for loop closures and add retrieval vectors from new submap to the database
@@ -386,12 +384,11 @@ class Solver:
             
         for key in predictions.keys():
             if isinstance(predictions[key], torch.Tensor) and key != "target_tokens":
-                predictions[key] = predictions[key].float().cpu().numpy()
-                if key != "images":
-                    predictions[key] = predictions[key].squeeze(0)  # remove batch dimension and convert to numpy
+                predictions[key] = predictions[key].float().cpu().numpy().squeeze(0)  # remove batch dimension and convert to numpy
     
         if predictions_lc is not None:
             predictions["frames_lc"] = lc_frames[0:2,...]
+            print(loop_closure_frame_names)
             predictions["frames_lc_names"] = loop_closure_frame_names
 
         return predictions

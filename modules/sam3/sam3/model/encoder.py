@@ -120,6 +120,7 @@ class TransformerEncoderLayer(nn.Module):
         )[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
+
         # Cross attention to image
         tgt2 = self.cross_attn_image(
             query=tgt + query_pos if self.pos_enc_at_cross_attn_queries else tgt,

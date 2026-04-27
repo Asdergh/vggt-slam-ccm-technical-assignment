@@ -46,6 +46,7 @@ class Sam3BasePredictor:
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
                 offload_video_to_cpu=request.get("offload_video_to_cpu", False),
+                offload_state_to_cpu=request.get("offload_state_to_cpu", False),
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -63,6 +64,7 @@ class Sam3BasePredictor:
                     getattr(self, "default_output_prob_thresh", 0.5),
                 ),
                 obj_id=request.get("obj_id", None),
+                rel_coordinates=request.get("rel_coordinates", True),
             )
         elif request_type == "remove_object":
             return self.remove_object(
@@ -107,11 +109,13 @@ class Sam3BasePredictor:
         resource_path,
         session_id=None,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
     ):
         """Start a new inference session on a video directory or path."""
         init_kwargs = dict(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
         )
         if hasattr(self, "async_loading_frames"):
             init_kwargs["async_loading_frames"] = self.async_loading_frames
@@ -143,6 +147,7 @@ class Sam3BasePredictor:
         clear_old_boxes: bool = True,
         output_prob_thresh: float = 0.5,
         obj_id: Optional[int] = None,
+        rel_coordinates: bool = True,
     ):
         """Add text, box and/or point prompt on a specific video frame."""
         session = self._get_session(session_id)
@@ -172,6 +177,7 @@ class Sam3BasePredictor:
             box_labels=bounding_box_labels,
             clear_old_boxes=clear_old_boxes,
             output_prob_thresh=output_prob_thresh,
+            rel_coordinates=rel_coordinates,
         )
         if obj_id is not None:
             kwargs["obj_id"] = obj_id
@@ -184,7 +190,8 @@ class Sam3BasePredictor:
         valid_params = set(sig.parameters.keys())
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
 
-        frame_idx, outputs = self.model.add_prompt(**filtered_kwargs)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            frame_idx, outputs = self.model.add_prompt(**filtered_kwargs)
         return {"frame_index": frame_idx, "outputs": outputs}
 
     def remove_object(
