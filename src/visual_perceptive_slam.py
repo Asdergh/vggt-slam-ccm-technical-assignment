@@ -20,7 +20,7 @@ from vggt_slam.slam_utils import sort_images_by_number
 
 
 @dataclass
-class VGGTSLAMConfig:
+class VisualPerceptiveSLAMConfig:
     image_folder: str = "examples/kitchen/images/"
     vis_map: bool = False
     vis_voxel_size: Optional[float] = None
@@ -42,7 +42,7 @@ class VGGTSLAMConfig:
     device: Optional[str]="cuda"
     use_optf_downsampling: bool=True
 
-class ImagesLoader(IterableDataset):
+class SequentialImageLoader(IterableDataset):
     def __init__(self, 
                  source: Optional[str]=None,
                  max_submap_size: Optional[int]=12,
@@ -51,7 +51,7 @@ class ImagesLoader(IterableDataset):
                  return_type: Optional[str]="string",
                  min_disparity: Optional[float]=50.0,
                  use_optf_downsampling: bool=True) -> None:
-        super(ImagesLoader, self).__init__()
+        super(SequentialImageLoader, self).__init__()
         self.max_submap_size = max_submap_size
         self.overlap_w = overlapping_window
         self.dom = dom_to_inclue
@@ -109,12 +109,12 @@ class ImagesLoader(IterableDataset):
             yield []
 
 
-class VGGTSLAMPipeline:
-    def __init__(self, config: VGGTSLAMConfig,
+class VisualPerceptiveSLAM:
+    def __init__(self, config: VisualPerceptiveSLAMConfig,
                  logger_origin: str="origin",
                  verbose: bool=True):
         self.cfg = config
-        dataset = ImagesLoader(
+        dataset = SequentialImageLoader(
             source=self.cfg.image_folder,
             max_submap_size=self.cfg.max_submap_size,
             overlapping_window=self.cfg.overlapping_window_size,
@@ -207,7 +207,7 @@ class VGGTSLAMPipeline:
         rr.log(f"{base_path}/3DReconstraction",
                 rr.Points3D(positions=points_xyz,
                             colors=points_rgb,
-                            radii=[0.003]))
+                            radii=[0.001]))
 
     def run_semantic_evalution(self):
         pass
@@ -215,10 +215,10 @@ class VGGTSLAMPipeline:
 
 if __name__ == "__main__":
     path = "/home/ram/Desktop/own_projects/vggt-slam-research/vggt_slam/office_loop"
-    config = VGGTSLAMConfig(image_folder=path)
-    pipline = VGGTSLAMPipeline(config, verbose=True)
+    config = VisualPerceptiveSLAMConfig(image_folder=path)
+    pipline = VisualPerceptiveSLAM(config, verbose=True)
     pipline.run_optimization()
-    # dataset = ImagesLoader(source=path)
+    # dataset = SequentialImageLoader(source=path)
     # print(len(dataset))
     # loader = DataLoader(dataset=dataset, batch_size=1, collate_fn=dataset.collate)
     # try:
