@@ -23,34 +23,7 @@ from simple_knn._C import distCUDA2
 from diff_gaussian_rasterization import (GaussianRasterizaer, 
                                          GaussianRasterizationSettings)
 
-
-
-
-
-
-class RenderOutput(NamedTuple):
-    render_rgb: torch.Tensor
-    render_depth: torch.Tensor
-    viewspace_points: torch.Tensor
-    visibility_filter: torch.Tensor
-    viewspace_points: torch.Tensor
-
-    @property
-    def get_max_vis_idx(self) -> int:
-        if self.render_rgb.ndim == 3:
-            return None
-        else:
-            max_val = -torch.inf
-            max_idx = None
-            for idx in range(self.render_rgb.size(0)):
-                vis_mask_power = self.visibility_filter.sum()
-                if max_val < vis_mask_power:
-                    max_val = vis_mask_power
-                    max_idx = idx
-            return max_idx
-                    
-                
-
+                  
 @dataclass 
 class SplatModuleInput:
     pts: Optional[PointCloud]=None
@@ -101,7 +74,28 @@ class SplatModuleConfig:
     def __post_init__(self):
         if self.training_config.steps < self.refine_config.refine_stop_iter:
             self.refine_config.refine_stop_iter = self.training_config.steps
-    
+
+class RenderOutput(NamedTuple):
+    render_rgb: torch.Tensor
+    render_depth: torch.Tensor
+    viewspace_points: torch.Tensor
+    visibility_filter: torch.Tensor
+    viewspace_points: torch.Tensor
+
+    @property
+    def get_max_vis_idx(self) -> int:
+        if self.render_rgb.ndim == 3:
+            return None
+        else:
+            max_val = -torch.inf
+            max_idx = None
+            for idx in range(self.render_rgb.size(0)):
+                vis_mask_power = self.visibility_filter.sum()
+                if max_val < vis_mask_power:
+                    max_val = vis_mask_power
+                    max_idx = idx
+            return max_idx
+        
 class Camera:
     def __init__(self, uid: int,
                  resolution: Tuple[int, int],
