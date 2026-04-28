@@ -61,7 +61,7 @@ class DSSIMLoss(nn.Module):
                    ((mu_pred_sq + mu_target_sq + self.c1) * (sigma_pred_sq + sigma_target_sq + self.c2))
         
         output = {}
-        output["loss"] = (1 - ssim_map).mean()
+        output["loss_scalar"] = (1 - ssim_map).mean()
         if return_mask:
             output["masks"] = {"sigma_pred_sq_mask": sigma_pred_sq,
                             "sigma_target_sq_mask": sigma_target_sq,
@@ -120,7 +120,7 @@ class GradientLoss(nn.Module):
             grad_diff_x = pred_grad_x - target_grad_x
             grad_diff_y = pred_grad_y - target_grad_y
             add = (grad_diff_x.abs() + grad_diff_y.abs())
-            output["loss"] = add.mean()
+            output["loss_scalar"] = add.mean()
             if return_mask:
                 output["masks"] = {"grad_diff_x": grad_diff_x,
                                    "grad_diff_y": grad_diff_y,
@@ -131,7 +131,7 @@ class GradientLoss(nn.Module):
             global_part = conf_mask * (pred - target)
             local_part = conf_mask * (pred_grad - target_grad)
             result_map = (global_part + local_part) - alpha*torch.log(conf_mask + 1e-4)
-            output["loss"] = result_map.mean()
+            output["loss_scalar"] = result_map.mean()
             if return_mask:
                 output["masks"] = {"pred_grad": pred_grad,
                                    "target_grad": target_grad,
@@ -147,9 +147,16 @@ class VisualLossModule(nn.Module):
                  **kwargs) -> None:
         super(VisualLossModule, self).__init__()
         def _check_argument(cls: Any):
-            return {k: v 
-                    for (k, v) in kwargs.items()
-                    if k in cls.__init__.__code__.co_varnames}
+            args = {}
+            for (k, v) in kwargs.items():
+                if ("kernel_size" not in k) and\
+                    (k in cls.__init__.__code__.co_varnames):
+                    args[k] = v
+            if isinstance(cls, DSSIMLoss):
+                args.update({"kernel_size": kwargs["dssim_kernel_size"]})
+            elif isinstance(cls, GradientLoss):
+                args.update({"kernel_size": kwargs["gradient_kernel_size"]})
+            return args
             
         self.dssim = DSSIMLoss(**_check_argument(DSSIMLoss)) if use_dssim else None
         self.gradient = GradientLoss(**_check_argument(GradientLoss)) if use_gradient else None

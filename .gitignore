@@ -1,3 +1,6 @@
 #spefic files
 src/semantic.py
 # src/splat_module.py
+src/wandb_example.py
+wandb/
+scene_path/

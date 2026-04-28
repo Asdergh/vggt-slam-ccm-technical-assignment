@@ -5,12 +5,18 @@ import torch.nn.functional as F
 import math
 import os
 import random as rd
+import wandb
+import yaml
+import cv2
+import open3d
 
+from torchvision.utils import make_grid
 from copy import deepcopy
 from dataclasses import (dataclass, field, asdict)
 from typing import (Optional, Any, Literal, Tuple, List, Dict, Any, NamedTuple)
 from gsplat.strategy import DefaultStrategy
-from torch.optimzer import Adam
+from gsplat.rendering import rasterization
+from torch.optim import Adam
 from open3d.geometry import PointCloud
 from open3d.utility import Vector3dVector as vec3d 
 from .utils import  (get_local_basis,
@@ -18,10 +24,12 @@ from .utils import  (get_local_basis,
                      getProjectionMatrix,
                      build_scaling_rotation,
                      strip_symmetric,
-                     render)
+                     render,
+                     VisualLossModule,
+                     min_max_normalization)
 from simple_knn._C import distCUDA2
-from diff_gaussian_rasterization import (GaussianRasterizaer, 
-                                         GaussianRasterizationSettings)
+# from diff_gaussian_rasterization import (GaussianRasterizaer, 
+#                                          GaussianRasterizationSettings)
 
                   
 @dataclass 
@@ -33,7 +41,19 @@ class SplatModuleInput:
     
 @dataclass 
 class OptConfig:
-    pass
+    scales_lr: float=1e-2
+    opacities_lr: float=1e-2
+    means_lr: float=1e-2
+    quats_lr: float=1e-2
+    loss_module_conig: Dict[str, Any]=field(default_factory=lambda: {
+        "reduction": "mean",
+        "gradient_kernel_size": 3,
+        "dssim_kernel_size": 11,
+        "sigma": 1.5,
+        "c1": 0.01**2,
+        "c2": 0.03**2,
+    })
+
 
 @dataclass
 class RefineConfig:
@@ -63,13 +83,16 @@ class TrainingConfig:
 
 @dataclass
 class SplatModuleConfig:
-    opt_config: OptConfig=OptConfig()
-    refine_config: RefineConfig=RefineConfig()
-    training_config: TrainingConfig=TrainingConfig()
+    opt_config: OptConfig=field(default_factory=OptConfig)
+    refine_config: RefineConfig=field(default_factory=RefineConfig)
+    training_config: TrainingConfig=field(default_factory=TrainingConfig)
     near: float=1
     far: float=100
     scaling_modifier: float=1.0
-    resolutions: Tuple[int]=field(default_factory=(224, 224))
+    resolution: Tuple[int]=(224, 224)
+    log_training_process: bool=True
+    log_every_step: int=100
+    project_name: str="vggt-slam-splat"
     sh_degree: int=2
     def __post_init__(self):
         if self.training_config.steps < self.refine_config.refine_stop_iter:
@@ -78,23 +101,21 @@ class SplatModuleConfig:
 class RenderOutput(NamedTuple):
     render_rgb: torch.Tensor
     render_depth: torch.Tensor
-    viewspace_points: torch.Tensor
-    visibility_filter: torch.Tensor
-    viewspace_points: torch.Tensor
+    meta: Dict[str, Any]
 
-    @property
-    def get_max_vis_idx(self) -> int:
-        if self.render_rgb.ndim == 3:
-            return None
-        else:
-            max_val = -torch.inf
-            max_idx = None
-            for idx in range(self.render_rgb.size(0)):
-                vis_mask_power = self.visibility_filter.sum()
-                if max_val < vis_mask_power:
-                    max_val = vis_mask_power
-                    max_idx = idx
-            return max_idx
+    # @property
+    # def get_max_vis_idx(self) -> int:
+    #     if self.render_rgb.ndim == 3:
+    #         return None
+    #     else:
+    #         max_val = -torch.inf
+    #         max_idx = None
+    #         for idx in range(self.render_rgb.size(0)):
+    #             vis_mask_power = self.visibility_filter.sum()
+    #             if max_val < vis_mask_power:
+    #                 max_val = vis_mask_power
+    #                 max_idx = idx
+    #         return max_idx
         
 class Camera:
     def __init__(self, uid: int,
@@ -106,11 +127,12 @@ class Camera:
                  near: float = 1.0,
                  far: float = 100.0) -> None:
 
+        self.resolution = resolution
         self.frame = frame \
                     if isinstance(frame, torch.Tensor)\
                     else torch.from_numpy(frame)\
                         .float().permute(2, 0, 1)
-        self.K = K.to(self.device)
+        self.K = K.to(device)
         self.viewmatrix = viewmatrix.to(device)
         self.image_width = resolution[0]
         self.image_height = resolution[1]
@@ -179,13 +201,14 @@ class Camera:
     @property
     def camera_center(self):
         return self.viewmatrix[:3, 3]
-
     
 class SplatModule(nn.Module):
     def __init__(self, config: SplatModuleConfig):
         super(SplatModule, self).__init__()
         self.config = config
-        self.loss = nn.MSELoss()
+        self.opt_config = config.opt_config
+        self.training_config = config.training_config
+        self.criterion = VisualLossModule(True, True, True, )
     
     def get_covarience(self, scaling_modifier: float=1.0):
         assert (hasattr(self, "scales") and hasattr(self, "quats")), \
@@ -206,6 +229,63 @@ class SplatModule(nn.Module):
             "covarience": self.get_covarience(scaling_modifier)
         }
     
+    def load(self, pts_cloud: Optional[PointCloud]=None,
+                 intrinsics: Optional[np.ndarray | torch.Tensor]=None,
+                 extrinsiscs: Optional[np.ndarray | torch.Tensor]=None,
+                 frames: Optional[np.ndarray | torch.Tensor]=None,
+                 path: Optional[str]=None):
+        assert (path is not None) \
+            or ((pts_cloud is not None)\
+            and (intrinsics is not None)\
+            and (extrinsiscs is not None)), \
+            ("""to load map you can ither od it 
+             from folder gnerated by VisualPerceptionSLAM 
+             or load from specified arguments""")
+        if path is None:
+            self.load_pts_map(pts_cloud)
+            self.load_frames(intrinsics, extrinsiscs, frames)
+        else:
+            self.load_from_folder(path)
+
+    def load_from_folder(self, path: str):
+        def _check_path(path: str):
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            return path
+            
+        assert os.path.exists(path), \
+        (f"couldn't fidn location: {path}")
+
+        ptsf = _check_path(os.path.join(path, "point_cloud.ply"))
+        pts = open3d.io.read_point_cloud(ptsf)
+        print(pts)
+        annotsf = _check_path(os.path.join(path, "annotations.yaml"))
+        with open(annotsf, "r") as file:
+            annots = yaml.safe_load(file)
+        
+        _ = _check_path(os.path.join(path, "images"))
+        (images, Twc, K) = ([], [], [])
+        for frame in annots.values():
+            img = min_max_normalization(torch\
+                .from_numpy(cv2.imread(frame["image_path"]))\
+                .permute(2, 0, 1)\
+                .float())
+            scale = torch.ones((3, 1))
+            if img.shape[-2:] != self.config.resolution:
+                old_res = torch.Tensor(list(img.shape[-2:]) + [1, ])
+                new_res = torch.Tensor(list(self.config.resolution) + [1, ])
+                scale = (new_res / old_res).view(3, 1)
+            exts = torch.Tensor(frame["extrinsics"])
+            ints = torch.Tensor(frame["intrinsics"])
+            ints[:3, :3] *= scale
+            images.append(img); Twc.append(exts); K.append(ints)
+
+        images = torch.stack(images)
+        Twc = torch.stack(Twc)
+        K = torch.stack(K)
+        self.load_frames(K, Twc, images)
+        self.load_pts_map(pts)
+        
     def load_frames(self, intrinsics: np.ndarray | torch.Tensor,
                     extrinsiscs: np.ndarray | torch.Tensor,
                     frames: np.ndarray | torch.Tensor):
@@ -223,10 +303,11 @@ class SplatModule(nn.Module):
             )
             self.frames[idx] = camera
         
-        self.idnices = [idx for idx in range(n)]
-        self._indices_stack = deepcopy(self.idnices)
+        self.indices = [idx for idx in range(n)]
+        self._indices_stack = deepcopy(self.indices)
 
-    def load_pts_map(self, pts_cloud: PointCloud, opt_config: Optional[Any]=None):
+    def load_pts_map(self, pts_cloud: PointCloud):
+        
         n = pts_cloud.points.shape[0]
         self.means = nn.Parameter(torch\
                                 .from_numpy(pts_cloud.points)\
@@ -235,9 +316,9 @@ class SplatModule(nn.Module):
         self.quats = nn.Parameter(torch.ones((n, 4)))
         self.scales = nn.Parameter(distCUDA2(self.means)\
             .view(-1, 1).repeat(1, 3))
-        colors = torch\
-                    .from_numpy((pts_cloud.colors / 255.0))\
-                    .view(-1, 1, 3)
+        colors = min_max_normalization(torch\
+                    .from_numpy(pts_cloud.colors)\
+                    .view(-1, 1, 3))
         features_sh = torch.zeros((n, ((self.sh_degree + 1) ** 2) - 1), 3)
         features = nn.torch.cat([self.colors, self.features_sh], dim=1)
         self.colors = nn.Parameter(colors)
@@ -246,10 +327,16 @@ class SplatModule(nn.Module):
         
         self.optimizers = {}
         for attrib in ("means", "opacities", "scales", "colors"):
-            opt = Adam([getattr(self, attrib)], lr=(1e-3 
-                                                    if opt_config is None 
-                                                    else opt_config[attrib]))
+            opt = Adam([getattr(self, attrib)], lr=(getattr(self.opt_config, f"{attrib}_lr")))
             self.optimizers[attrib] = opt
+    
+    def optimizer_zero(self):
+        for opt in self.optimizers.values():
+            opt.zero_grad()
+    
+    def optimizer_step(self):
+        for opt in self.optimizers.values():
+            opt.step()
     
     def set_refine_status(self, refine_config: Optional[RefineConfig]):
         self.ref_strategy = DefaultStrategy(**asdict(refine_config))
@@ -258,7 +345,7 @@ class SplatModule(nn.Module):
         output = []
         for _ in range(n):
             if not self._indices_stack:
-                self._indices_stack = deepcopy(self.idnices)
+                self._indices_stack = deepcopy(self.indices)
             idx = rd.cohice(self._indices_stack)
             viewpoint = self.frames[idx]
             output.append(viewpoint)
@@ -273,7 +360,6 @@ class SplatModule(nn.Module):
                bg_color: Optional[torch.Tensor]=None,
                mask: Optional[torch.Tensor]=None):
         
-        batched = {}
         bg_color = bg_color.to(self.device) \
                     if bg_color is not None \
                     else torch.zeros((3, )).to(self.device) 
@@ -285,45 +371,96 @@ class SplatModule(nn.Module):
              1) viewpoint_idx: List[int] - indices of current existing viewpoints,
              2) viewpoint: List[Camera] - object with all nececesry attributes
              3) viewpoints_extrinsics/intrinsics: torch.Tensor - batch of extrinsics/intrinsics""")
+        (exts, ints) = ([], [])
         if viewpoints is not None:
-            pass
+            for cam in viewpoints:
+                exts.append(cam.viewmatrix)
+                exts.append(cam.K)
         elif viewpoints_idx is not None:
-            viewpoints = [self.frames[idx] for idx in viewpoints_idx]
+            for idx in viewpoints_idx:
+                exts.append(self.frames[idx].viewmatrix)
+                ints.append(self.frames[idx].K)
         elif viewpoints_intrinsics and viewpoints_extrinsics:
-            viewpoints = [Camera(uid=idx, 
-                                 K=K, viewmatrix=viewmatrix,
-                                 near=self.config.near,
-                                 far=self.config.far)
-                                for idx, (K, viewmatrix) \
-                                    in enumerate(zip(viewpoints_intrinsics, 
-                                                     viewpoints_extrinsics))]
-        for (idx, view) in enumerate(viewpoints):
-            render_pkg = render(
-                viewpoint_camera=view,
-                pc=self.get_dict(scaling_modifier),
-                bg_color=bg_color,
-                override_color=(mask if mask is None else mask[idx, ...]),
-                sh_degree=self.sh_deggree
-            )
-            for (key, value) in render_pkg.items():
-                if key not in batched:
-                    batched[key] = []
-                batched[key].append(value)
-        for (key, value) in batched:
-            batched[key] = torch.stack(value).to(self.device)
-        return RenderOutput(**batched)
+            exts = viewpoints_extrinsics.to(self.device)
+            ints = viewpoints_intrinsics.to(self.device)
+
+        (render_rgb, render_depth, meta) = rasterization(
+            **self.get_dict(scaling_modifier),
+            Ks=ints,
+            viewmatrix=exts,
+            width=self.config.resolution[0],
+            height=self.config.resolution[1],
+            near=self.config.near,
+            far=self.config.far
+        )
+        return RenderOutput(render_rgb, render_depth, meta)
     
     def fit(self, input_pkg: SplatModuleInput):
 
-        self.load_map(input_pkg.pts, self.config.opt_cofig)
+        self.load_map(input_pkg.pts)
         if not hasattr(self, "ref_strategy"):
             self.set_refine_status(self.config.refine_config)
         strategy_state = self.ref_strategy.initialize_state()
-        for step in range(self.config.train_config.steps):
-            viewpoints = self.sample_viewpoints(self.config.train_config.view_batch_size)
+
+        for step in range(self.training_config.steps):
+            self.optimizer_zero()
+            viewpoints = self.sample_viewpoints(self.training_config.view_batch_size)
             gt_rgb = torch.stack([cam.frame for cam in viewpoints]).to(self.device)
             render_pkg = self.render(viewpoints=viewpoints, scaling_modifier=self.config.scaling_modifier)
-            loss = self.loss(render_pkg.render_rgb, gt_rgb)
+            criterion_pkg = self.criterion(render_pkg.render_rgb, gt_rgb)
+
+            scalars = {}
+            masks = {}
+            for (k, v) in criterion_pkg.items():
+                if isinstance(v, Dict):
+                    scalars[f"{k}_loss"] = v["loss_scalar"]
+                    for (mask_name, values) in v["masks"].items():
+                        values = min_max_normalization(values)
+                        values = make_grid(values)\
+                            .cpu().detach().numpy()
+                        masks[f"{k}_{mask_name}"] = wandb.Image(values)
+
+            self.ref_strategy.step_pre_backward(self.get_dict(), self.optimizers, strategy_state, step, render_pkg.meta)
+            loss = sum(list(scalars.values())).backward()
+            self.ref_strategy.step_post_backward(self.get_dict(), self.optimizers, strategy_state, step, render_pkg.meta)
+            self.optimizer_step()
+            if self.config.log_training_process \
+            and (step % self.config.log_every_step == 0):
+                wandb.log(scalars | masks | {"total_loss": loss, "epoch": step})
+        wandb.finish()
+    
+
+if __name__ == "__main__":
+    # from .visual_perceptive_slam import (VisualPerceptiveSLAM,
+    #                                     VisualPerceptiveSLAMConfig)
+    # path = "/home/ram/Desktop/own_projects/vggt-slam-research/modules/vggt-slam/office_loop"
+    # config = VisualPerceptiveSLAMConfig(image_folder=path, sequences_n=1)
+    # pipline = VisualPerceptiveSLAM(config, verbose=True)
+    # pipline.run_optimization()
+    # pipline.save_scene("/home/ram/Desktop/own_projects/vggt-slam-research/scene_path")
+    
+    path = "/home/ram/Desktop/own_projects/vggt-slam-research/scene_path"
+    splat_config = SplatModuleConfig()
+    splat_module = SplatModule(splat_config)
+    splat_module.load(path=path)
+    
+    random_idx = rd.sample(splat_module.indices, 3)
+    render_pkg = splat_module.render(random_idx)
+    print(render_pkg.render_rgb.size())
+
+    
+    
+    
+    
+        
+
+
+                        
+                    
+                
+                    
+                
+            
             
             
         

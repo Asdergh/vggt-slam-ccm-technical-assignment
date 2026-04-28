@@ -43,7 +43,7 @@ class Solver:
         self.init_conf_threshold = init_conf_threshold
         self.vis_voxel_size = vis_voxel_size
 
-        self.viewer = Viewer()
+        # self.viewer = Viewer()
 
         self.flow_tracker = FrameTracker()
         self.map = GraphMap()
@@ -67,13 +67,13 @@ class Solver:
             pcd = pcd.voxel_down_sample(self.vis_voxel_size)
             points_in_world_frame = np.asarray(pcd.points, dtype=np.float32)
             points_colors = (np.asarray(pcd.colors) * 255).astype(np.uint8)
-        self.viewer.server.scene.add_point_cloud(
-            name="pcd_"+name,
-            points=points_in_world_frame,
-            colors=points_colors,
-            point_size=point_size,
-            point_shape="circle",
-        )
+        # self.viewer.server.scene.add_point_cloud(
+        #     name="pcd_"+name,
+        #     points=points_in_world_frame,
+        #     colors=points_colors,
+        #     point_size=point_size,
+        #     point_shape="circle",
+        # )
 
     def set_submap_point_cloud(self, submap):
         # Add the point cloud to the visualization.
@@ -86,7 +86,7 @@ class Solver:
         # Add the camera poses to the visualization.
         extrinsics = submap.get_all_poses_world(self.graph)
         images = submap.get_all_frames()
-        self.viewer.visualize_frames(extrinsics, images, submap.get_id())
+        # self.viewer.visualize_frames(extrinsics, images, submap.get_id())
 
     def update_all_submap_vis(self):
         for submap in self.map.get_submaps():

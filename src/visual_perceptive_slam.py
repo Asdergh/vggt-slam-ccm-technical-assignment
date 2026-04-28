@@ -3,6 +3,8 @@ import numpy as np
 import rerun as rr
 import os
 import cv2
+import open3d
+import yaml 
 
 from dataclasses import (dataclass, field)
 from torch.utils.data import (IterableDataset, DataLoader)
@@ -16,6 +18,9 @@ from vggt.utils.load_fn import load_and_preprocess_images
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 from vggt_slam.slam_utils import sort_images_by_number
+from open3d.geometry import PointCloud
+from open3d.utility import Vector3dVector as vec3d 
+from .utils import min_max_normalization
 
 
 
@@ -41,6 +46,7 @@ class VisualPerceptiveSLAMConfig:
     sam_model_checkpoints: Optional[str]=None
     device: Optional[str]="cuda"
     use_optf_downsampling: bool=True
+    sequences_n: Optional[int]=None
 
 class SequentialImageLoader(IterableDataset):
     def __init__(self, 
@@ -50,7 +56,8 @@ class SequentialImageLoader(IterableDataset):
                  dom_to_inclue: Optional[str]="RGB",
                  return_type: Optional[str]="string",
                  min_disparity: Optional[float]=50.0,
-                 use_optf_downsampling: bool=True) -> None:
+                 use_optf_downsampling: bool=True,
+                 sequences_n: Optional[int]=None) -> None:
         super(SequentialImageLoader, self).__init__()
         self.max_submap_size = max_submap_size
         self.overlap_w = overlapping_window
@@ -58,10 +65,14 @@ class SequentialImageLoader(IterableDataset):
         self.return_type = return_type
         self.min_disparity = min_disparity
         self.use_optf_downsampling = use_optf_downsampling
+        self.sequences_n = sequences_n
         self.frame_tracker = FrameTracker()
 
         self._counter = 0
+        self._full_sequences_counter = 0
         self._last_images_stack = []
+        self.sources = None
+        self._optimized = False
         if source is not None:
             self.sources = self.load_data(source)
     
@@ -75,12 +86,13 @@ class SequentialImageLoader(IterableDataset):
                     and ("depth" not in fname)
             ])
             return sources
+        else:
+            warn(f"Couldn't find location: {source}")
             
     def __len__(self) -> int:
-        assert (hasattr(self, "sources")), \
-        (f"call load_data()")
+        assert (self.sources is not None),\
+        ("you must load the data first from existed source folder!!!")
         return len(self.sources)
-    
     
     def collate(self, _) -> List:
         for imgf in self.sources[self._counter + 1:]:
@@ -98,16 +110,15 @@ class SequentialImageLoader(IterableDataset):
             if (len(self._last_images_stack) > (self.max_submap_size + self.overlap_w)):
                 batch = self._last_images_stack
                 self._last_images_stack = self._last_images_stack[-self.overlap_w:]
+                self._full_sequences_counter += 1
                 return batch
-        return []
     
     def __iter__(self):
-        while True:
-            if self._counter == len(self):
-                self._counter = 0
+        while self._counter < (len(self) - 1):
+            if self.sequences_n is not None \
+            and self._full_sequences_counter == self.sequences_n:
                 break
             yield []
-
 
 class VisualPerceptiveSLAM:
     def __init__(self, config: VisualPerceptiveSLAMConfig,
@@ -119,7 +130,8 @@ class VisualPerceptiveSLAM:
             max_submap_size=self.cfg.max_submap_size,
             overlapping_window=self.cfg.overlapping_window_size,
             dom_to_inclue="RGB",
-            return_type="string"
+            return_type="string",
+            sequences_n=self.cfg.sequences_n
         )
         self.loader = DataLoader(dataset=dataset,
                                  batch_size=1,
@@ -158,10 +170,10 @@ class VisualPerceptiveSLAM:
             self.sam3_processor = Sam3Processor(self.sam3, confidence_threshold=0.5)
             
     def run_optimization(self):
+        self._optimized = True
         if hasattr(self, "vggt"):
             for idx, frames_stack in enumerate(self.loader):
                 if frames_stack:
-                    # print(len(frames_stack), self.loader.dataset._counter, len(self.loader))
                     predictions = self.solver\
                         .run_predictions(
                             image_names=frames_stack,
@@ -174,19 +186,21 @@ class VisualPerceptiveSLAM:
                     self.solver.graph.optimize()
                     loop_closure_detected = len(predictions["detected_loops"]) > 0
                     if loop_closure_detected:
-                        for submap in self.solver.map\
-                            .get_submaps():
-                            self.log_submap(submap, idx)
+                        # rr.set_time("grpah_optimization_steps", sequence=0)
+                        for (gpo_idx, submap) in enumerate(self.solver.map\
+                            .get_submaps()):
+                            self.log_submap(submap, idx + gpo_idx)
                     else:
+                        print(f"LOADING NON LOOP CLOSURE SUBMAPS: {idx}")
                         self.log_submap(self.solver\
                                         .map\
-                                        .get_latest_submap())
+                                        .get_latest_submap(), idx)
         else:
             warn("without VGGT pipline would work only in viewer mode")
     
-    def log_submap(self, submap: Submap, time: int=None):
+    def log_submap(self, submap: Submap, time: int=None, sequence_name: str="time"):
         if time is not None:
-            rr.set_time("time", sequence=time)
+            rr.set_time(sequence_name, sequence=time)
         base_path = f"{self.logger_origin}/Submap_{submap.get_id()}"
         color = np.random.rand(3)
         points_xyz = submap.get_points_in_world_frame(self.solver.graph)
@@ -196,28 +210,100 @@ class VisualPerceptiveSLAM:
         for frame_idx in range(extrinsics.shape[0]):
             K = submap.proj_mats[frame_idx, ...]
             world2cam = extrinsics[frame_idx, ...]
-            cam2world = np.linalg.inv(world2cam)
             image = images[frame_idx, ...]
-            # print(image.shape)
             rr.log(f"{base_path}/Frames/frame_{frame_idx}",
-                   rr.Transform3D(translation=cam2world[:, -1],
-                                  mat3x3=cam2world[:, :-1]),
+                   rr.Transform3D(mat3x3=world2cam[:3, :3],
+                                  translation=world2cam[:3, 3]),
                                   rr.Pinhole(image_from_camera=K[:3, :3], color=color),
-                                  rr.Image(image))
+                                  rr.Image(image.permute(1, 2, 0)))
         rr.log(f"{base_path}/3DReconstraction",
                 rr.Points3D(positions=points_xyz,
                             colors=points_rgb,
                             radii=[0.001]))
-
-    def run_semantic_evalution(self):
-        pass
+    
+    def get_scene(self) -> Dict[str, Any]:
+        if not self._optimized:
+            raise RuntimeError("full scene can be generated only with run_optimization() procedure!!")
+        all_points = []
+        all_colors = []
+        all_exts = []
+        all_ints = []
+        all_frames = []
+        for submap in self.solver.map.submaps.values():
+            frames = submap.get_all_frames()
+            pts = submap.get_points_in_world_frame(self.solver.graph)
+            pts_colors = (submap.get_points_colors() / 255.0)
+            poses_stack_mat4x4 = submap.get_all_poses_world(self.solver.graph)
+            intrinsics_stack_mat3x3 = submap.proj_mats
+            all_frames.append(frames)
+            all_points.append(pts)
+            all_colors.append(pts_colors)
+            all_exts.append(poses_stack_mat4x4)
+            all_ints.append(intrinsics_stack_mat3x3)
+        
+        pts = PointCloud()
+        pts.points = vec3d(np.concatenate(all_points))
+        pts.colors = vec3d(np.concatenate(all_colors))
+        all_frames = torch.cat(all_frames).permute(0, 2, 3, 1).cpu().numpy()
+        all_exts = np.concatenate(all_exts)
+        all_ints = np.concatenate(all_ints)
+        return {
+            "pts_cloud": pts,
+            "frames": all_frames,
+            "intrinsics": all_ints,
+            "extrinsics": all_exts,
+        }
+    
+    def save_scene(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        scene_dict = self.get_scene()
+        pts_path = os.path.join(path, "point_cloud.ply")
+        open3d.io.write_point_cloud(pts_path, scene_dict["pts_cloud"])
+        
+        frames_path = os.path.join(path, "images")
+        os.makedirs(frames_path, exist_ok=True)
+        images_paths = []
+        for idx, image in enumerate(scene_dict["frames"]):
+            image = min_max_normalization(image, 0, 255)
+            print(image.shape)
+            image = image.astype(np.uint8)
+            img_path = os.path.join(frames_path, f"image_{idx}.png")
+            cv2.imwrite(img_path, image)
+            images_paths.append(img_path)
+        
+        annotations = os.path.join(path, "annotations.yaml")
+        with open(annotations, "w") as file:
+            data = {}
+            for idx in range(scene_dict["frames"].shape[0]):
+                data[f"frame_{idx}"] = {
+                    "extrinsics": scene_dict["extrinsics"][idx, ...].tolist(),
+                    "intrinsics": scene_dict["intrinsics"][idx, ...].tolist(),
+                    "image_path": images_paths[idx],
+                }
+            yaml.safe_dump(data, file)
+            
+    
 
 
 if __name__ == "__main__":
-    path = "/home/ram/Desktop/own_projects/vggt-slam-research/vggt_slam/office_loop"
+    path = "/home/ram/Desktop/own_projects/vggt-slam-research/modules/vggt-slam/office_loop"
     config = VisualPerceptiveSLAMConfig(image_folder=path)
-    pipline = VisualPerceptiveSLAM(config, verbose=True)
-    pipline.run_optimization()
+    # self.cfg = config
+    dataset = SequentialImageLoader(
+        source=config.image_folder,
+        max_submap_size=config.max_submap_size,
+        overlapping_window=config.overlapping_window_size,
+        dom_to_inclue="RGB",
+        return_type="string"
+    )
+    loader = DataLoader(dataset=dataset,
+                                 batch_size=1,
+                                 collate_fn=dataset.collate)
+    for (idx, sample) in enumerate(loader):
+        # print(idx)
+        pass
+    # pipline = VisualPerceptiveSLAM(config, verbose=True)
+    # pipline.run_optimization()
     # dataset = SequentialImageLoader(source=path)
     # print(len(dataset))
     # loader = DataLoader(dataset=dataset, batch_size=1, collate_fn=dataset.collate)
