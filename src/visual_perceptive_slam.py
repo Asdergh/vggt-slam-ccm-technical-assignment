@@ -265,7 +265,6 @@ class VisualPerceptiveSLAM:
         images_paths = []
         for idx, image in enumerate(scene_dict["frames"]):
             image = min_max_normalization(image, 0, 255)
-            print(image.shape)
             image = image.astype(np.uint8)
             img_path = os.path.join(frames_path, f"image_{idx}.png")
             cv2.imwrite(img_path, image)

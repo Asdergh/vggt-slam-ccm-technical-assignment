@@ -1,6 +1,7 @@
 #spefic files
-src/semantic.py
+# src/semantic_module.py
 # src/splat_module.py
 src/wandb_example.py
 wandb/
 scene_path/
+src/clip_test.py

@@ -9,7 +9,7 @@ import wandb
 import yaml
 import cv2
 import open3d
-
+import inspect
 from torchvision.utils import make_grid
 from copy import deepcopy
 from dataclasses import (dataclass, field, asdict)
@@ -26,7 +26,8 @@ from .utils import  (get_local_basis,
                      strip_symmetric,
                      render,
                      VisualLossModule,
-                     min_max_normalization)
+                     min_max_normalization,
+                     as_learnable)
 from simple_knn._C import distCUDA2
 # from diff_gaussian_rasterization import (GaussianRasterizaer, 
 #                                          GaussianRasterizationSettings)
@@ -45,6 +46,7 @@ class OptConfig:
     opacities_lr: float=1e-2
     means_lr: float=1e-2
     quats_lr: float=1e-2
+    colors_lr: float=1e-2
     loss_module_conig: Dict[str, Any]=field(default_factory=lambda: {
         "reduction": "mean",
         "gradient_kernel_size": 3,
@@ -87,13 +89,14 @@ class SplatModuleConfig:
     refine_config: RefineConfig=field(default_factory=RefineConfig)
     training_config: TrainingConfig=field(default_factory=TrainingConfig)
     near: float=1
-    far: float=100
+    far: float=10
     scaling_modifier: float=1.0
-    resolution: Tuple[int]=(224, 224)
+    resolution: Optional[Tuple[int]]=None
     log_training_process: bool=True
     log_every_step: int=100
     project_name: str="vggt-slam-splat"
     sh_degree: int=2
+    device: str="cuda"
     def __post_init__(self):
         if self.training_config.steps < self.refine_config.refine_stop_iter:
             self.refine_config.refine_stop_iter = self.training_config.steps
@@ -117,29 +120,35 @@ class RenderOutput(NamedTuple):
     #                 max_idx = idx
     #         return max_idx
         
-class Camera:
+class Frame:
     def __init__(self, uid: int,
                  resolution: Tuple[int, int],
                  viewmatrix: torch.Tensor,
                  K: torch.Tensor,
-                 frame: Optional[np.ndarray | torch.Tensor]=None,
+                 image: Optional[torch.Tensor]=None,
+                 depth: Optional[torch.Tensor]=None,
                  device: str = "cuda",
                  near: float = 1.0,
-                 far: float = 100.0) -> None:
+                 far: float = 100.0,
+                 embedding: Optional[torch.Tensor]=None) -> None:
 
         self.resolution = resolution
-        self.frame = frame \
-                    if isinstance(frame, torch.Tensor)\
-                    else torch.from_numpy(frame)\
-                        .float().permute(2, 0, 1)
-        self.K = K.to(device)
-        self.viewmatrix = viewmatrix.to(device)
+        self.image = image 
+        self.depth = depth
+        self.K = K
+        self.viewmatrix = viewmatrix
         self.image_width = resolution[0]
         self.image_height = resolution[1]
         self.near = near; self.far = far
+        self.embedding = embedding
 
         self.projection = getProjectionMatrix(near, far, self.FoVx, self.FoVy).to(device)
-        self.full_projection = viewmatrix @ self.projection
+        self.full_projection = self.viewmatrix @ self.projection
+        for (k, v) in vars(self).items():
+            if isinstance(v, torch.Tensor):
+                v = v.to(device)
+                setattr(self, k, v)
+
 
     @property
     def tanfov_x(self):
@@ -166,37 +175,12 @@ class Camera:
         self.full_projection = self.full_projection.to(device)
         return self
     
-    def get_rays(self, uv_grid: torch.Tensor = None):
-        if uv_grid is None:
-            w_space = torch.linspace(0, self.resolution[0], steps=self.resolution[0])
-            h_space = torch.linspace(0, self.resolution[1], steps=self.resolution[1])
-            uv_grid = torch.stack(torch.meshgrid(w_space, h_space, indexing='ij'), dim=-1).reshape(-1, 2)
-        else:
-            if isinstance(uv_grid, np.ndarray):
-                uv_grid = torch.from_numpy(uv_grid).float()
-        n = uv_grid.shape[0]
-        uv_grid = torch.cat([uv_grid, torch.ones((n, 1), device=uv_grid.device)], dim=1)
-        K_inv = torch.linalg.inv(self.K)
-        d = (K_inv @ uv_grid.T).T
-        d_norm = d / torch.linalg.norm(d, dim=1, keepdim=True)
-        return d_norm.to(self.device)
-
-    @property
-    def world2cam_rays(self):
-        rays = self.get_rays()
-        n = rays.shape[0]
-        rays_hom = torch.cat([rays, torch.ones((n, 1), device=rays.device)], dim=1)
-        rays_w2c = (self.viewmatrix @ rays_hom.T).T[:, :3]
-        return rays_w2c
-
-    @property
-    def cam2world_rays(self):
-        rays = self.get_rays()
-        n = rays.shape[0]
-        rays_hom = torch.cat([rays, torch.ones((n, 1), device=rays.device)], dim=1)
-        Twc_inv = torch.linalg.inv(self.viewmatrix)
-        rays_c2w = (Twc_inv @ rays_hom.T).T[:, :3]
-        return rays_c2w
+    def cam2world_projection(self, pix: torch.Tensor):
+        homo = torch.cat([pix, torch.ones(pix.size(0), 1)], dim=-1)
+        local_pts = self.depth[pix[:, 0], pix[:, 1]] * (torch.linalg.inv(self.K) @ homo.T).T
+        local_homo = torch.cat([local_pts, torch.ones(pix.size(0), 1)], dim=-1)
+        global_pts = (torch.linalg.inv(self.viewmatrix) @ local_homo.T).T[:, :-1]
+        return global_pts
 
     @property
     def camera_center(self):
@@ -208,22 +192,23 @@ class SplatModule(nn.Module):
         self.config = config
         self.opt_config = config.opt_config
         self.training_config = config.training_config
-        self.criterion = VisualLossModule(True, True, True, )
+        self.criterion = VisualLossModule(True, True, True)
     
     def get_covarience(self, scaling_modifier: float=1.0):
         assert (hasattr(self, "scales") and hasattr(self, "quats")), \
         ("To get covarience you first need to load map")
+        print(self.scales.size())
         M = build_scaling_rotation(self.scales * scaling_modifier, self.quats)
         covarience = strip_symmetric(M @ M.transpose(-1, -2))
         return covarience
     
-    def get_dict(self, scaling_modifier: float=1.0) -> Dict[str, Any]:
+    def get_dict(self, scaling_modifier: float=1.0, factor: float=1.0) -> Dict[str, Any]:
         return {
-            "means": self.means,
+            "means": self.means * factor,
             "quats": self.quats,
-            "scales": self.scales,
-            "opacities": self.opacities,
-            "features_rgb": self.colors,
+            "scales": self.scales * scaling_modifier,
+            "opacities": self.opacities.squeeze(),
+            "colors": self.colors.squeeze(),
             "features_sh": self.features_sh,
             "features": self.features,
             "covarience": self.get_covarience(scaling_modifier)
@@ -271,7 +256,8 @@ class SplatModule(nn.Module):
                 .permute(2, 0, 1)\
                 .float())
             scale = torch.ones((3, 1))
-            if img.shape[-2:] != self.config.resolution:
+            if (self.config.resolution is not None) \
+                and (img.shape[-2:] != self.config.resolution):
                 old_res = torch.Tensor(list(img.shape[-2:]) + [1, ])
                 new_res = torch.Tensor(list(self.config.resolution) + [1, ])
                 scale = (new_res / old_res).view(3, 1)
@@ -292,38 +278,44 @@ class SplatModule(nn.Module):
         n = intrinsics.shape[0]
         self.frames = {}
         for idx in range(n):
-            camera = Camera(
+            image = frames[idx, ...]
+            resolution = image.shape[-2:]\
+                            if self.config.resolution is None\
+                            else self.config.resolution
+            camera = Frame(
                 uid=idx,
-                frame=frames,
+                frame=image,
                 viewmatrix=extrinsiscs[idx, ...],
                 K=intrinsics[idx, ...],
                 near=self.config.near,
                 far=self.config.far,
-                resolution=self.config.resolution
+                resolution=resolution
             )
             self.frames[idx] = camera
+        if self.config.resolution is None:
+            self._resolution = resolution
         
         self.indices = [idx for idx in range(n)]
         self._indices_stack = deepcopy(self.indices)
 
     def load_pts_map(self, pts_cloud: PointCloud):
         
-        n = pts_cloud.points.shape[0]
-        self.means = nn.Parameter(torch\
-                                .from_numpy(pts_cloud.points)\
-                                .float())
-        self.opacities = nn.Parameter(torch.rand(n, 1))
-        self.quats = nn.Parameter(torch.ones((n, 4)))
-        self.scales = nn.Parameter(distCUDA2(self.means)\
-            .view(-1, 1).repeat(1, 3))
+        points_xyz = np.asarray(pts_cloud.points)
+        points_rgb = np.asarray(pts_cloud.colors)
+        n = points_xyz.shape[0]
+        self.means = as_learnable(points_xyz)
+        self.scales = as_learnable(distCUDA2(self.means.float()).view(-1, 1).repeat(1, 3))
+                                    
         colors = min_max_normalization(torch\
-                    .from_numpy(pts_cloud.colors)\
+                    .from_numpy(points_rgb)\
                     .view(-1, 1, 3))
-        features_sh = torch.zeros((n, ((self.sh_degree + 1) ** 2) - 1), 3)
-        features = nn.torch.cat([self.colors, self.features_sh], dim=1)
-        self.colors = nn.Parameter(colors)
-        self.features_sh = nn.Parameter(features_sh)
-        self.features = nn.Parameter(features)
+        features_sh = torch.zeros((n, ((self.config.sh_degree + 1) ** 2) - 1, 3))
+        features = torch.cat([colors, features_sh], dim=1)
+        self.opacities = as_learnable(torch.rand(n, 1), self.config.device)
+        self.quats = as_learnable(torch.ones((n, 4)), self.config.device)
+        self.colors = as_learnable(colors, self.config.device)
+        self.features_sh = as_learnable(features_sh, self.config.device)
+        self.features = as_learnable(features, self.config.device)
         
         self.optimizers = {}
         for attrib in ("means", "opacities", "scales", "colors"):
@@ -341,7 +333,7 @@ class SplatModule(nn.Module):
     def set_refine_status(self, refine_config: Optional[RefineConfig]):
         self.ref_strategy = DefaultStrategy(**asdict(refine_config))
 
-    def sample_viewpoints(self, n: int=12) -> List[Camera]:
+    def sample_viewpoints(self, n: int=12) -> List[Frame]:
         output = []
         for _ in range(n):
             if not self._indices_stack:
@@ -353,45 +345,61 @@ class SplatModule(nn.Module):
     
     def render(self, 
                viewpoints_idx: Optional[List[int]]=None,
-               viewpoints: Optional[List[Camera]]=None,
+               viewpoints: Optional[List[Frame]]=None,
                viewpoints_extrinsics: Optional[torch.Tensor]=None,
                viewpoints_intrinsics: Optional[torch.Tensor]=None,
                scaling_modifier: float=1.0,
+               xyz_factor: float=1.0,
                bg_color: Optional[torch.Tensor]=None,
                mask: Optional[torch.Tensor]=None):
         
-        bg_color = bg_color.to(self.device) \
+        bg_color = bg_color.to(self.config.device) \
                     if bg_color is not None \
-                    else torch.zeros((3, )).to(self.device) 
+                    else torch.zeros((3, )).to(self.config.device) 
         assert (viewpoints_idx is not None) \
             or (viewpoints is not None)\
             or ((viewpoints_extrinsics is not None)
                 and (viewpoints_intrinsics is not None)), \
             ("""One of inputs types must be passed:
              1) viewpoint_idx: List[int] - indices of current existing viewpoints,
-             2) viewpoint: List[Camera] - object with all nececesry attributes
+             2) viewpoint: List[Frame] - object with all nececesry attributes
              3) viewpoints_extrinsics/intrinsics: torch.Tensor - batch of extrinsics/intrinsics""")
         (exts, ints) = ([], [])
         if viewpoints is not None:
             for cam in viewpoints:
                 exts.append(cam.viewmatrix)
                 exts.append(cam.K)
+            exts = torch.stack(exts)
+            ints = torch.stack(ints)
         elif viewpoints_idx is not None:
             for idx in viewpoints_idx:
                 exts.append(self.frames[idx].viewmatrix)
                 ints.append(self.frames[idx].K)
+            exts = torch.stack(exts)
+            ints = torch.stack(ints)
         elif viewpoints_intrinsics and viewpoints_extrinsics:
-            exts = viewpoints_extrinsics.to(self.device)
-            ints = viewpoints_intrinsics.to(self.device)
+            exts = viewpoints_extrinsics
+            ints = viewpoints_intrinsics
+        
+        exts = exts.float().to(self.config.device)
+        ints = ints.float().to(self.config.device)
+        rasterization_pkg = {key: value.float() 
+                  for (key, value) in self.get_dict(scaling_modifier, xyz_factor).items() 
+                  if key in inspect.signature(rasterization).parameters}
+        for (k, v) in rasterization_pkg.items():
+            print(k, v.size(), v.dtype)
 
+        resolution = self.config.resolution\
+                        if self.config.resolution is not None\
+                        else self._resolution
         (render_rgb, render_depth, meta) = rasterization(
-            **self.get_dict(scaling_modifier),
-            Ks=ints,
-            viewmatrix=exts,
-            width=self.config.resolution[0],
-            height=self.config.resolution[1],
-            near=self.config.near,
-            far=self.config.far
+            **rasterization_pkg,
+            Ks=ints[:, :3, :3],
+            viewmats=exts,
+            width=resolution[0],
+            height=resolution[1],
+            near_plane=self.config.near,
+            far_plane=self.config.far
         )
         return RenderOutput(render_rgb, render_depth, meta)
     
@@ -405,7 +413,7 @@ class SplatModule(nn.Module):
         for step in range(self.training_config.steps):
             self.optimizer_zero()
             viewpoints = self.sample_viewpoints(self.training_config.view_batch_size)
-            gt_rgb = torch.stack([cam.frame for cam in viewpoints]).to(self.device)
+            gt_rgb = torch.stack([cam.frame for cam in viewpoints]).to(self.config.device)
             render_pkg = self.render(viewpoints=viewpoints, scaling_modifier=self.config.scaling_modifier)
             criterion_pkg = self.criterion(render_pkg.render_rgb, gt_rgb)
 
@@ -444,9 +452,20 @@ if __name__ == "__main__":
     splat_module = SplatModule(splat_config)
     splat_module.load(path=path)
     
-    random_idx = rd.sample(splat_module.indices, 3)
-    render_pkg = splat_module.render(random_idx)
-    print(render_pkg.render_rgb.size())
+    random_idx = rd.sample(splat_module.indices, 12)
+    render_pkg1 = splat_module.render(random_idx, xyz_factor=1e+1)
+    render_pkg2 = splat_module.render(random_idx, xyz_factor=1.0)
+    rgb1 = render_pkg1.render_rgb.permute(0, 3, 1, 2)
+    rgb1 = make_grid(rgb1).permute(1, 2, 0).cpu().detach().numpy()
+    rgb2 = render_pkg2.render_rgb.permute(0, 3, 1, 2)
+    rgb2 = make_grid(rgb2).permute(1, 2, 0).cpu().detach().numpy()
+
+    import matplotlib.pyplot as plt
+    plt.style.use("dark_background")
+    _, axis = plt.subplots(nrows=2)
+    axis[0].imshow(rgb1)
+    axis[1].imshow(rgb2)
+    plt.show()
 
     
     
